@@ -1,3 +1,28 @@
+#!/bin/bash
+
+# TB Variant Calling Pipeline
+# Author: Your Name / Institution
+# Description: Automated pipeline for processing Nanopore reads of Mycobacterium tuberculosis
+
+set -euo pipefail
+
+# Prompt for user input
+clear
+echo -e "\n\e[93m############################\e[0m \e[92mPipeline Configuration\e[0m \e[93m############################\e[0m\n"
+
+read -rp $'\e[92mEnter the name of the sequencing run (e.g. 01112024_TB):\e[0m\n' RunName
+read -rp $'\e[92mEnter the path to the directory containing FAST5 files:\e[0m\n' DirFast5
+read -rp $'\e[92mEnter the number of samples to process:\e[0m\n' NumSamples
+
+# Display collected input
+printf '\n\e[34m================================================================================\e[0m\n'
+echo -e "\e[32mInput Summary:\e[0m"
+echo "1) Run Name     : ${RunName}"
+echo "2) FAST5 Path   : ${DirFast5}"
+echo "3) Num Samples  : ${NumSamples}"
+printf '\e[34m================================================================================\e[0m\n\n'
+
+# Define default parameters
 DirFinalFiles="/mnt/HPC-DISK-210/TB_Results"
 ConfigFile="dna_r9.4.1_450bps_hac.cfg"
 Barcodes="barcode_arrs_nb96.cfg"
@@ -5,319 +30,178 @@ MinLen=50
 MaxLen=6000
 Threads=12
 Normalise=200
-DirAnalysis="$DirFinalFiles/$RunName"
-DirBasecalling="$DirAnalysis/Basecalling" # "${DirFinalFiles}${RunName}" # "/mnt/HPC-DISK-210/TB_Results/${RunName}"
 ConfigPath="/opt/ont/guppy/data/"
 DirConfig="${ConfigPath}${ConfigFile}"
-DirBarcoder="$DirAnalysis/Demultiplexing" # "${DirBasecalling}_demultiplexing"
-DirCurrent=$(pwd)
 DirScheme="/root/artic-ncov2019/primer_schemes"
 DirRef="/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V3/NC_000962.3.fasta"
 
+# Construct analysis paths
+DirAnalysis="$DirFinalFiles/$RunName"
+DirBasecalling="$DirAnalysis/Basecalling"
+DirBarcoder="$DirAnalysis/Demultiplexing"
+
+# Create directories
+mkdir -p "$DirAnalysis"
+cd "$DirAnalysis"
+
+# Activate conda environment
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate artic-ncov2019
 
-cd $DirFinalFiles
-mkdir $RunName
-cd $DirAnalysis
+# Run Guppy Basecalling
+echo "\n[INFO] Starting basecalling at $(date)"
+guppy_basecaller \
+  -i "$DirFast5" \
+  -s "$DirBasecalling" \
+  -c "$DirConfig" \
+  -x 'cuda:0,1' \
+  --barcode_kits "EXP-NBD196" \
+  --allow_inferior_barcodes \
+  --compress_fastq \
+  --verbose_logs
 
-echo ""
-echo "###################################################################################################"
-echo "#####################    Basecalling ===> $(date)      #######################"
-echo "###################################################################################################"
-
-guppy_basecaller -i $DirFast5 -s $DirBasecalling -c $DirConfig -x 'cuda:0,1' --barcode_kits "EXP-NBD196" --allow_inferior_barcodes --compress_fastq --verbose_logs
-
-for a in $(ls $DirBasecalling/pass | grep -E "barcode[0..$NumSamples]"); do
-
-echo ""
-echo "##############################################################################################"
-echo "#######     ARTIC Processing $a ===> $(date)      ########"
-echo "##############################################################################################"
-
-mkdir $a
-cd $a
-
-echo ""
-echo "##############################################################################################"
-echo "####    Filtering artic guppyplex processing $a ===> $(date)    ####"
-echo "##############################################################################################"
-
-artic guppyplex --min-length $MinLen --max-length $MaxLen --directory $DirBasecalling/pass/$a --prefix $RunName > artic_guppyplex_log.txt
-
-cd ..
+# Run ARTIC guppyplex per barcode
+for a in $(ls "$DirBasecalling/pass" | grep -E "barcode[0-9]+"); do
+  echo "\n[INFO] Processing $a with ARTIC guppyplex at $(date)"
+  mkdir -p "$a"
+  cd "$a"
+  artic guppyplex --min-length "$MinLen" --max-length "$MaxLen" \
+    --directory "$DirBasecalling/pass/$a" --prefix "$RunName" > artic_guppyplex_log.txt
+  cd ..
 done
 
-# Activar entorno pycoQC
+# Run pycoQC quality report
 conda activate pycoQC
+echo "\n[INFO] Generating pycoQC report at $(date)"
+pycoQC --summary_file "$DirBasecalling/sequencing_summary.txt" \
+       -o "${RunName}_summary.html"
 
-echo ""
-echo "################################################################################################################################"
-echo "################# Estadisticos de numero de reads y calidad phred de corrido ${RunName} -> $(date) ##################"
-echo "################################################################################################################################"
-pycoQC --summary_file "${DirAnalysis}/Basecalling/sequencing_summary.txt" -o ${RunName}_summary.html
-
-# Activar el entorno py38
+# Re-activate working conda environment
 conda activate py38
 
-# Indice de referencia
-samtools faidx /root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V3/NC_000962.3.fasta
+# Index the reference genome
+samtools faidx "$DirRef"
 
+# Start per-sample processing
+for i in $(seq 1 "$NumSamples"); do
+  sample="sample$i"
+  barcode_dir="${DirFinalFiles}/${RunName}/barcode0${i}"
+  sample_fastq="${barcode_dir}/${RunName}_barcode0${i}.fastq"
 
-for i in $(seq 1 $NumSamples); do
+  echo "\n[INFO] Processing ${sample} at $(date)"
 
-    sample="sample$i"
-    echo ""
-    echo -e "\e[34m###################################################################################################\e[0m"
-    echo -e "\e[34m######################\e[0m \e[33mProcesando ${sample} -> $(date)\e[0m \e[34m#########################\e[0m"
-    echo -e "\e[34m###################################################################################################\e[0m"
-    vcf_template="/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/template.vcf"
-    variant_db="/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V3/variant_db.sorted.normalised.vcf.gz"
-####    amplicon_bed="/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V3/TB_amplicons.bed"
-    reference="/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V3/NC_000962.3.fasta"
-    genbank="/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V3/NC_000962.3.gb"
+  conda activate NEXTFLOW
+  cd "$barcode_dir"
 
-    conda activate NEXTFLOW
+  minimap2 -a -x map-ont -t "$Threads" "$DirRef" "$sample_fastq" | samtools sort -o "${sample}.bam"
+  samtools index "${sample}.bam"
 
-    cd "${DirFinalFiles}/${RunName}/barcode0${i}"
+  conda activate PYTHON
+  nanoq -vv -s -r "${RunName}_${sample}.subsampled.stats.txt" -i "$sample_fastq"
 
-    echo ""
-    echo "########################################################################################################################"
-    echo "####################    Index and Mapping with BWA $a ===> $(date)   ################################"
-    echo "########################################################################################################################"
+  bcftools mpileup \
+    --max-depth 10000 --threads 4 -BI -Q 1 \
+    --ff SECONDARY,UNMAP \
+    --annotate INFO/AD,INFO/ADF,INFO/ADR \
+    -O v -f "$DirRef" "${sample}.bam" > "${sample}.mpileup.vcf"
 
-    minimap2 -a -x map-ont -t 12 ${reference} "${DirFinalFiles}/${RunName}/barcode0${i}/${RunName}_barcode0${i}.fastq" | samtools sort -o "${DirFinalFiles}/${RunName}/barcode0${i}/${sample}.sorted.bam"
-    mv "${DirFinalFiles}/${RunName}/barcode0${i}/${sample}.sorted.bam" ${sample}.bam
-    samtools index "${DirFinalFiles}/${RunName}/barcode0${i}/${sample}.bam"
+  awk '/^#CHROM/ {print "##INFO=<ID=ALT_DEPTH,Number=1,Type=String,Description=\"Depth of alternative alleles\">"}1' \
+    "${sample}.mpileup.vcf" > "${sample}.mpileup.fixed.vcf"
+  bgzip -c "${sample}.mpileup.fixed.vcf" > "${sample}.mpileup.vcf.gz"
+  tabix "${sample}.mpileup.vcf.gz"
 
-    conda activate PYTHON
+  bcftools norm --remove-duplicates -Oz "${sample}.mpileup.vcf.gz" -o "${sample}.mpileup.vcf.gz.dedup"
+  tabix "${sample}.mpileup.vcf.gz.dedup"
+  bcftools norm -m- -Oz "${sample}.mpileup.vcf.gz.dedup" -o "${sample}.mpileup.vcf.gz.norm"
+  tabix "${sample}.mpileup.vcf.gz.norm"
+  bcftools view "${sample}.mpileup.vcf.gz.norm" > "${sample}.mpileup.vcf.gz.norm.vcf"
 
-    echo ""
-    echo "##########################################################################################################################"
-    echo "###############    Statistics summary of nanopore reads with Nanoq $a ===> $(date)   ##################"
-    echo "##########################################################################################################################"
-    nanoq -vv -s -r "$DirFinalFiles/${RunName}/barcode0${i}/${RunName}_${sample}.subsampled.stats.txt" -i "$DirFinalFiles/${RunName}/barcode0${i}/${RunName}_barcode0${i}.fastq"
+  vcf_template="/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/template.vcf"
+  python /root/.nextflow/assets/epi2me-labs/wf-tb-amr/bin/process_mpileup.py \
+    --template "$vcf_template" \
+    --mpileup "${sample}.mpileup.vcf.gz.norm.vcf" \
+    --out_vcf "${sample}.mpileup.annotated.processed.vcf" \
+    --sample "$sample" -a 0.1 -d 5 -b 1000 -p 20
 
-    echo ""
-    echo "#########################################################################"
-    echo "###  Creando el ${sample}.mpileup.vcf ==> $(date)  ###"
-    echo "#########################################################################"
-    bcftools mpileup \
-      --max-depth 10000 \
-      --threads 4 \
-      -BI \
-      -Q 1 \
-      --ff SECONDARY,UNMAP \
-      --annotate INFO/AD,INFO/ADF,INFO/ADR \
-      -O v \
-      -f ${reference} ${sample}.bam > ${sample}.mpileup.vcf
+  bcftools view --exclude-type indels "${sample}.mpileup.annotated.processed.vcf" | \
+    bcftools view -f 'PASS' - > "${sample}.mpileup.annotated.processed.PASS.vcf"
 
-    echo ""
-    echo "####################################################################################"
-    echo "##################### Agregar encabezado a ${sample}.mpileup.vcf #####################"
-    echo "####################################################################################"
-    awk '/^#CHROM/ {print "##INFO=<ID=ALT_DEPTH,Number=1,Type=String,Description=\"Depth of alternative alleles\">"}1' ${sample}.mpileup.vcf > ${sample}.mpileup.fixed.vcf
+  samtools addreplacerg -r "ID:${sample}\tSM:${sample}" -o "${sample}.rg.bam" "${sample}.bam"
+  samtools sort -o "${sample}.sorted.rg.bam" "${sample}.rg.bam"
+  samtools index "${sample}.sorted.rg.bam"
+  samtools faidx "$DirRef"
 
-    echo ""
-    echo "##############################################################################"
-    echo "##################### Generando ${sample}.mpileup.vcf.gz #######################"
-    echo "##############################################################################"
-    bgzip ${sample}.mpileup.fixed.vcf -c > ${sample}.mpileup.vcf.gz
-    tabix ${sample}.mpileup.vcf.gz
+  conda activate py38
+  read_count=$(samtools view -c "${sample}.rg.bam")
+  if [ "$read_count" -gt 0 ]; then
+    whatshap phase -o "${sample}.phased.vcf" --reference "$DirRef" \
+      "${sample}.mpileup.annotated.processed.PASS.vcf" "${sample}.sorted.rg.bam"
+  else
+    cp "$vcf_template" "${sample}.phased.vcf"
+  fi
 
-    echo ""
-    echo "#############################################################################"
-    echo "##################### Eliminación de duplicados ${sample} #####################"
-    echo "#############################################################################"
-    bcftools norm --remove-duplicates -Oz ${sample}.mpileup.vcf.gz -o ${sample}.mpileup.vcf.gz.dedup
-    tabix ${sample}.mpileup.vcf.gz.dedup
-
-    bcftools norm -m- -Oz ${sample}.mpileup.vcf.gz.dedup -o ${sample}.mpileup.vcf.gz.norm
-    tabix ${sample}.mpileup.vcf.gz.norm
-
-    bcftools view ${sample}.mpileup.vcf.gz.norm > ${sample}.mpileup.vcf.gz.norm.vcf
-
-    echo ""
-    echo "#############################################################################"
-    echo "##################### Llamado de variantes para ${sample} #####################"
-    echo "#############################################################################"
-    python /root/.nextflow/assets/epi2me-labs/wf-tb-amr/bin/process_mpileup.py \
-      --template ${vcf_template} \
-      --mpileup ${sample}.mpileup.vcf.gz.norm.vcf \
-      --out_vcf ${sample}.mpileup.annotated.processed.vcf \
-      --sample ${sample} \
-      -a 0.1 \
-      -d 5 \
-      -b 1000 \
-      -p 20
-
-    echo ""
-    echo "##############################################################################################"
-    echo "##################### Filtrar variantes que cumplen criterios y son SNPs #####################"
-    echo "##############################################################################################"
-    bcftools view --exclude-type indels ${sample}.mpileup.annotated.processed.vcf | bcftools view -f 'PASS' - > ${sample}.mpileup.annotated.processed.PASS.vcf
-
-    echo ""
-    echo "###############################################################################################"
-    echo "##################### Agregando encabezado a lecturas he indexar los .BAM #####################"
-    echo "###############################################################################################"
-    samtools addreplacerg -r "ID:sample${i}\tSM:${sample}" -o ${sample}.rg.bam ${sample}.bam
-    samtools sort -o ${sample}.sorted.rg.bam ${sample}.rg.bam
-    samtools index ${sample}.sorted.rg.bam
-    samtools faidx ${reference}
-
-    conda activate py38
-
-    echo ""
-    echo "##########################################################################################"
-    echo "##################### Contando las lecturas en el .BAM en la ${sample} #####################"
-    echo "##########################################################################################"
-    read_count=$(samtools view -c ${sample}.rg.bam)
-    if [ "${read_count}" -gt "0" ]; then
-        whatshap phase \
-          -o ${sample}.phased.vcf \
-          --reference=/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V3/NC_000962.3.fasta \
-          ${sample}.mpileup.annotated.processed.PASS.vcf ${sample}.sorted.rg.bam
-    else
-        cp /root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/template.vcf ${sample}.phased.vcf
-    fi
-
-    echo ""
-    echo "###################################################################################################"
-    echo "###################### Anotación de codones de ${sample}.phased.vcf con GENBAK ######################"
-    echo "###################################################################################################"
-    cp ${genbank} .
-    docker run --rm -v ${DirFinalFiles}/${RunName}/barcode0${i}:/data:Z quay.io/biocontainers/vcf-annotator:0.7--hdfd78af_0 \
+  genbank="/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V3/NC_000962.3.gb"
+  cp "$genbank" .
+  docker run --rm -v "$barcode_dir:/data:Z" quay.io/biocontainers/vcf-annotator:0.7--hdfd78af_0 \
     bash -c "vcf-annotator --output /data/${sample}.phased.codon.vcf /data/${sample}.phased.vcf /data/NC_000962.3.gb"
 
-    echo ""
-    echo "#########################################################################################"
-    echo "######################## Procesando el archivo con AWK para ${sample} ########################"
-    echo "#########################################################################################"
-
-    awk -F'\t' -v OFS='\t' '
-    BEGIN {
-        header=1
-        fields_missing="RPB=.;MQB=.;BQB=.;MQSB=.;RPBZ=.;MQBZ=.;BQBZ=.;MQSBZ=.;SCBZ=."
-        n = split(fields_missing, missing_fields, ";")
+  awk -F'\t' -v OFS='\t' '
+  BEGIN {
+    header=1
+    fields_missing="RPB=.;MQB=.;BQB=.;MQSB=.;RPBZ=.;MQBZ=.;BQBZ=.;MQSBZ=.;SCBZ=."
+    n = split(fields_missing, missing_fields, ";")
+  }
+  {
+    if ($1 ~ /^##/) { print; next }
+    if ($1 ~ /^#CHROM/) { header=0; print; next }
+    if (!header) {
+      for (f = 1; f <= n; f++) {
+        if ($8 !~ missing_fields[f]) { $8 = $8 ";" missing_fields[f] }
+      }
+      print
     }
-    {
-        if ($1 ~ /^##/) {
-            print; next
-        }
+  }' "${sample}.phased.codon.vcf" > "${sample}.phased.codon.fixed.vcf"
 
-        if ($1 ~ /^#CHROM/) {
-            header=0
-            print
-            next
-        }
+  conda activate PYTHON
+  python /root/.nextflow/assets/epi2me-labs/wf-tb-amr/bin/process_whatshap.py \
+    --phased_vcf "${sample}.phased.codon.fixed.vcf" \
+    --out_vcf "${sample}.phased.processed.vcf" \
+    --template "$vcf_template" --sample "$sample"
 
-        if (!header) {
+  bcftools sort "${sample}.phased.processed.vcf" > "${sample}.phased.processed.sorted.vcf"
+  bgzip "${sample}.phased.processed.sorted.vcf"
+  tabix "${sample}.phased.processed.sorted.vcf.gz"
 
-            for (f = 1; f <= n; f++) {
-                if ($8 !~ missing_fields[f]) {
-                    $8 = $8";"missing_fields[f]
-                }
-            }
-            print
-        }
-    }' ${sample}.phased.codon.vcf > ${sample}.phased.codon.fixed.vcf
-
-    conda activate PYTHON
-    echo ""
-    echo "#########################################################################################"
-    echo "##################### Comprimir y indexar el archivo VCF resultante #####################"
-    echo "#########################################################################################"
-    python /root/.nextflow/assets/epi2me-labs/wf-tb-amr/bin/process_whatshap.py \
-      --phased_vcf ${sample}.phased.codon.fixed.vcf \
-      --out_vcf ${sample}.phased.processed.vcf \
-      --template ${vcf_template} \
-      --sample ${sample}
-
-    echo ""
-    echo "#########################################################################################"
-    echo "################ Ordenar y comprimir archivo ${sample}.phased.processed.vcf ###############"
-    echo "#########################################################################################"
-    bcftools sort ${sample}.phased.processed.vcf > ${sample}.phased.processed.sorted.vcf
-    bgzip ${sample}.phased.processed.sorted.vcf
-    tabix ${sample}.phased.processed.sorted.vcf.gz
-
-    echo ""
-    echo "#####################################################################################################################"
-    echo "#################### Anotación con bcftools de ${sample} para resistencia a antibioticos NEXTFLOW #####################"
-    echo "#####################################################################################################################"
+  for db in ANTIBIOTICS WHO LINEAGES; do
+    case "$db" in
+      ANTIBIOTICS) vcfdb=V3/variant_db.sorted.normalised.vcf.gz ;;
+      WHO) vcfdb=V1/variant_db.sorted.normalised_WHO.vcf.gz ;;
+      LINEAGES) vcfdb=V1/variant_db.sorted.normalised_LINEAGES.vcf.gz ;;
+    esac
     bcftools annotate \
       -c CHROM,POS,REF,GENE,STRAND,AA,FEATURE_TYPE,EFFECT,GENE_LOCUS,WHO_POS,ANTIBIOTICS,PROTEIN_ID,HGVS_NUCLEOTIDE,HGVS_PROTEIN,CODON_NUMBER,ORIGIN \
       --remove INFO/FeatureType,INFO/IsSynonymous,INFO/IsTransition,INFO/IsGenic,INFO/IsPseudo,INFO/Inference,INFO/AltCodon,INFO/AltAminoAcid,INFO/Note,INFO/AminoAcidChange,INFO/Product,INFO/SNPCodonPosition \
       -h /root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/bcftools_annotate_header.txt \
-      -a /root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V3/variant_db.sorted.normalised.vcf.gz \
-      ${sample}.phased.processed.sorted.vcf.gz > ${sample}.phased.processed.sorted.annotated.ANTIBIOTICS.vcf
+      -a "/root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/$vcfdb" \
+      "${sample}.phased.processed.sorted.vcf.gz" > "${sample}.phased.processed.sorted.annotated.${db}.vcf"
 
-    echo ""
-    echo "#################################################################################################################"
-    echo "##################### Anotación con bcftools de ${sample} para resistencia a antibioticos WHO #####################"
-    echo "#################################################################################################################"
-    bcftools annotate \
-      -c CHROM,POS,REF,GENE,STRAND,AA,FEATURE_TYPE,EFFECT,GENE_LOCUS,WHO_POS,ANTIBIOTICS,PROTEIN_ID,HGVS_NUCLEOTIDE,HGVS_PROTEIN,CODON_NUMBER,ORIGIN \
-      --remove INFO/FeatureType,INFO/IsSynonymous,INFO/IsTransition,INFO/IsGenic,INFO/IsPseudo,INFO/Inference,INFO/AltCodon,INFO/AltAminoAcid,INFO/Note,INFO/AminoAcidChange,INFO/Product,INFO/SNPCodonPosition \
-      -h /root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/bcftools_annotate_header.txt \
-      -a /root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V1/variant_db.sorted.normalised_WHO.vcf.gz \
-      ${sample}.phased.processed.sorted.vcf.gz > ${sample}.phased.processed.sorted.annotated.WHO.vcf
+    bcftools filter -i 'INFO/ORIGIN=="WHO_CANONICAL"' "${sample}.phased.processed.sorted.annotated.${db}.vcf" > "${sample}.final.${db}.vcf"
+    grep -v "^##" "${sample}.final.${db}.vcf" > "${sample}.final.${db}_filtrado.vcf"
+  done
 
-    echo ""
-    echo "##########################################################################################################################"
-    echo "####################### Anotación con bcftools de ${sample} para resistencia a antibioticos Lineages #######################"
-    echo "##########################################################################################################################"
-    bcftools annotate \
-      -c CHROM,POS,REF,GENE,STRAND,AA,FEATURE_TYPE,EFFECT,GENE_LOCUS,WHO_POS,ANTIBIOTICS,PROTEIN_ID,HGVS_NUCLEOTIDE,HGVS_PROTEIN,CODON_NUMBER,ORIGIN \
-      --remove INFO/FeatureType,INFO/IsSynonymous,INFO/IsTransition,INFO/IsGenic,INFO/IsPseudo,INFO/Inference,INFO/AltCodon,INFO/AltAminoAcid,INFO/Note,INFO/AminoAcidChange,INFO/Product,INFO/SNPCodonPosition \
-      -h /root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/bcftools_annotate_header.txt \
-      -a /root/.nextflow/assets/epi2me-labs/wf-tb-amr/data/primer_schemes/V1/variant_db.sorted.normalised_LINEAGES.vcf.gz \
-      ${sample}.phased.processed.sorted.vcf.gz > ${sample}.phased.processed.sorted.annotated.LINEAGES.vcf
+  cat ${sample}.final.*_filtrado.vcf > "${sample}.final.Concatenado.vcf"
 
+  conda activate base
+  samtools mpileup -uf "$DirRef" "${sample}.sorted.rg.bam" | bcftools call -mv -Oz -o "${sample}_raw.vcf.gz"
+  bcftools index "${sample}_raw.vcf.gz"
+  bcftools filter -i 'QUAL>20' "${sample}_raw.vcf.gz" -Oz -o "${sample}_filtered.vcf.gz"
+  bcftools index "${sample}_filtered.vcf.gz"
+  bcftools consensus -f "$DirRef" "${sample}_filtered.vcf.gz" > "${sample}_consensus.fastq"
+  seqtk seq -aQ64 -q20 -n N "${sample}_consensus.fastq" > "${sample}_consensus.fasta"
 
-    echo ""
-    echo "##################################################################################"
-    echo "##################### Filtrar variantes con bcftools ${sample} #####################"
-    echo "##################################################################################"
-    bcftools filter -i 'INFO/ORIGIN=="WHO_CANONICAL"' ${sample}.phased.processed.sorted.annotated.ANTIBIOTICS.vcf > ${sample}.final.ANTIBIOTICS.vcf
-
-
-    echo ""
-    echo "##################################################################################"
-    echo "##################### Filtrar variantes con bcftools ${sample} #####################"
-    echo "##################################################################################"
-    bcftools filter -i 'INFO/ORIGIN=="WHO_CANONICAL"' ${sample}.phased.processed.sorted.annotated.WHO.vcf > ${sample}.final.WHO.vcf
-
-
-    echo ""
-    echo "##################################################################################"
-    echo "##################### Filtrar variantes con bcftools ${sample} #####################"
-    echo "##################################################################################"
-    bcftools filter -i 'INFO/ORIGIN=="WHO_CANONICAL"' ${sample}.phased.processed.sorted.annotated.LINEAGES.vcf > ${sample}.final.LINEAGES.vcf
-
-    grep -v "##" ${sample}.final.ANTIBIOTICS.vcf > ${sample}.final.ANTIBIOTICS_filtrado.vcf
-    grep -v "#" ${sample}.final.WHO.vcf > ${sample}.final.WHO_filtrado.vcf
-    grep -v "#" ${sample}.final.LINEAGES.vcf > ${sample}.final.LINEAGES_filtrado.vcf
-    cat ${sample}.final.ANTIBIOTICS_filtrado.vcf ${sample}.final.WHO_filtrado.vcf ${sample}.final.LINEAGES_filtrado.vcf > ${sample}.final.Concatenado.vcf
-
-    echo ""
-    echo "###########################################################################################"
-    echo "##################### Generación de archivo consenso .fasta ${sample} #######################"
-    echo "###########################################################################################"
-    conda activate base
-
-    samtools mpileup -uf ${reference} "${DirFinalFiles}/${RunName}/barcode0${i}/${sample}.sorted.rg.bam" | bcftools call -mv -Oz -o ${sample}_raw.vcf.gz
-    bcftools index ${sample}_raw.vcf.gz
-    bcftools filter -i 'QUAL>20' ${sample}_raw.vcf.gz -Oz -o ${sample}_filtered.vcf.gz
-    bcftools index ${sample}_filtered.vcf.gz
-    bcftools consensus -f ${reference} ${sample}_filtered.vcf.gz > ${sample}_consensus.fastq
-    seqtk seq -aQ64 -q20 -n N ${sample}_consensus.fastq > ${sample}_consensus.fasta
-
-    echo ""
-    echo "#############################################################################################################################################"
-    echo "######################################## ${sample} termina sin errores -> $(date) ########################################"
-    echo "#############################################################################################################################################"
-
-
+  echo "\n[INFO] ${sample} completed at $(date)"
 done
+
+echo "\n[INFO] Pipeline completed successfully."
+
+exit 0
