@@ -1,4 +1,4 @@
-# 🧬 Nanopore-based *Mycobacterium tuberculosis* Variant Calling and Resistance Analysis Pipeline
+# Nanopore-based *Mycobacterium tuberculosis* Variant Calling and Resistance Analysis Pipeline
 
 This repository contains a Bash pipeline designed for processing **Oxford Nanopore** sequencing data of *Mycobacterium tuberculosis* (MTB). The workflow automates basecalling, demultiplexing, quality control, alignment, variant calling, phasing, and functional annotation—focusing on drug resistance mutations and lineage classification.
 
