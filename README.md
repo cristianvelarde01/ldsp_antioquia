@@ -138,7 +138,7 @@ MIT License
 ## 👥 Authors
 
 Developed by the [Laboratorio Departamental de Salud publica de Antioquia].  
-For questions or issues, please open a GitHub issue or contact [idabely.betancur@antioquia.gov.co].
+For questions or issues, please open a GitHub issue or contact [cristian.velarde@upb.edu.co] [idabely.betancur@antioquia.gov.co].
 
 ---
 
